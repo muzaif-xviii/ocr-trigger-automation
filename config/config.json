@@ -3,6 +3,8 @@
   "region": null,
   "ocr_confidence_threshold": 60,
   "active_profile": "default",
+  "tesseract_cmd": "",
+  "global_enabled": true,
   "triggers": [
     {
       "id": "example-001",
@@ -14,10 +16,7 @@
       "cooldown": 3,
       "action": {
         "type": "hotkey",
-        "keys": [
-          "alt",
-          "1"
-        ]
+        "keys": ["alt", "1"]
       }
     },
     {
@@ -31,34 +30,11 @@
       "action": {
         "type": "sequence",
         "sequence": [
-          {
-            "type": "hotkey",
-            "keys": [
-              "alt",
-              "1"
-            ]
-          },
-          {
-            "type": "delay",
-            "ms": 500
-          },
-          {
-            "type": "hotkey",
-            "keys": [
-              "f2"
-            ]
-          },
-          {
-            "type": "delay",
-            "ms": 200
-          },
-          {
-            "type": "hotkey",
-            "keys": [
-              "ctrl",
-              "3"
-            ]
-          }
+          {"type": "hotkey", "keys": ["alt", "1"]},
+          {"type": "delay", "ms": 500},
+          {"type": "hotkey", "keys": ["f2"]},
+          {"type": "delay", "ms": 200},
+          {"type": "hotkey", "keys": ["ctrl", "3"]}
         ]
       }
     },
@@ -72,12 +48,8 @@
       "cooldown": 10,
       "action": {
         "type": "hotkey",
-        "keys": [
-          "f1"
-        ]
+        "keys": ["f1"]
       }
     }
-  ],
-  "global_enabled": true,
-  "tesseract_cmd": ""
+  ]
 }

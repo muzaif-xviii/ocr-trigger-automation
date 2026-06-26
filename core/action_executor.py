@@ -1,7 +1,21 @@
 """
 action_executor.py
-Executes keyboard actions (hotkeys, sequences, delays) via the keyboard library.
-Runs actions in a dedicated thread to avoid blocking the OCR loop.
+Executes keyboard actions (hotkeys, text typing, sequences, delays) via the
+keyboard library. Runs actions in a dedicated thread to avoid blocking the
+OCR loop.
+
+Supported top-level action types
+---------------------------------
+hotkey   — press a key combination: {"type":"hotkey","keys":["alt","1"]}
+text     — type a string verbatim:  {"type":"text","text":"/ma \"Cure\" <t>"}
+sequence — ordered list of steps:   {"type":"sequence","sequence":[...]}
+
+Supported sequence step types
+-------------------------------
+hotkey   — {"type":"hotkey","keys":["ctrl","1"]}
+key      — {"type":"key","key":"enter"}        (single named key)
+text     — {"type":"text","text":"hello"}       (typed string)
+delay    — {"type":"delay","ms":500}            (sleep N milliseconds)
 """
 
 import logging
@@ -18,10 +32,6 @@ logger = logging.getLogger(__name__)
 class ActionExecutor:
     """
     Thread-safe action queue that executes keyboard macros.
-
-    Supports two action types:
-    - hotkey: press a combination like alt+1, ctrl+shift+f2
-    - sequence: list of steps [{type:hotkey|delay, keys:[...], ms:N}]
 
     Usage
     -----
@@ -82,7 +92,6 @@ class ActionExecutor:
                 action = self._queue.get(timeout=0.1)
             except Empty:
                 continue
-
             try:
                 self._dispatch(action)
             except Exception as exc:
@@ -91,57 +100,95 @@ class ActionExecutor:
                 self._queue.task_done()
 
     def _dispatch(self, action: dict[str, Any]) -> None:
+        """Route a top-level action dict to the correct handler."""
         action_type = action.get("type", "hotkey")
 
         if action_type == "hotkey":
             self._press_hotkey(action.get("keys", []))
 
+        elif action_type == "text":
+            self._type_text(action.get("text", ""))
+
         elif action_type == "sequence":
-            steps = action.get("sequence", [])
-            for step in steps:
-                step_type = step.get("type")
-                if step_type == "hotkey":
-                    self._press_hotkey(step.get("keys", []))
-                elif step_type == "delay":
-                    ms = int(step.get("ms", 0))
+            self._run_sequence(action.get("sequence", []))
+
+    # ------------------------------------------------------------------ #
+    # Sequence runner                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _run_sequence(self, steps: list[dict[str, Any]]) -> None:
+        """Execute each step in the sequence in order."""
+        for step in steps:
+            step_type = step.get("type")
+
+            if step_type == "hotkey":
+                self._press_hotkey(step.get("keys", []))
+
+            elif step_type == "key":
+                k = step.get("key", "").strip()
+                if k:
+                    keyboard.press_and_release(k)
+                    logger.debug("Key: %s", k)
+
+            elif step_type == "text":
+                self._type_text(step.get("text", ""))
+
+            elif step_type == "delay":
+                ms = int(step.get("ms", 0))
+                if ms > 0:
                     time.sleep(ms / 1000.0)
-                elif step_type == "key":
-                    k = step.get("key", "")
-                    if k:
-                        keyboard.press_and_release(k)
+                    logger.debug("Delay: %dms", ms)
+
+            else:
+                logger.warning("Unknown sequence step type: %r", step_type)
+
+    # ------------------------------------------------------------------ #
+    # Primitive actions                                                    #
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _press_hotkey(keys: list[str]) -> None:
         """
-        Press a combination of keys.
+        Press a key combination.
 
-        keys = ["alt", "1"]  ->  Alt+1
-        keys = ["ctrl", "shift", "f2"]  ->  Ctrl+Shift+F2
+        keys = ["alt", "1"]              ->  Alt+1
+        keys = ["ctrl", "shift", "f2"]   ->  Ctrl+Shift+F2
         """
         if not keys:
             return
-
         clean = [k.strip().lower() for k in keys if k.strip()]
         if not clean:
             return
+        combo = "+".join(clean)
+        keyboard.press_and_release(combo)
+        logger.debug("Hotkey: %s", combo)
 
-        if len(clean) == 1:
-            keyboard.press_and_release(clean[0])
-        else:
-            combo = "+".join(clean)
-            keyboard.press_and_release(combo)
+    @staticmethod
+    def _type_text(text: str) -> None:
+        """
+        Type a string exactly as provided using keyboard.write().
 
-        logger.debug("Pressed: %s", "+".join(clean))
+        keyboard.write() sends individual key-down/key-up events for each
+        character, which works correctly with game chat boxes.  It respects
+        the current keyboard layout for standard ASCII characters.
+
+        Special characters like <t>, quotes, angle brackets, and spaces are
+        all typed literally — no escaping is needed.
+        """
+        if not text:
+            return
+        keyboard.write(text, delay=0.02)
+        logger.debug("Text typed: %r", text[:40])
 
     # ------------------------------------------------------------------ #
-    # Helpers: parse human-readable key strings                           #
+    # Helpers                                                              #
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def parse_hotkey_string(hotkey_str: str) -> list[str]:
         """
-        Parse 'Alt+1', 'Ctrl+Shift+F2' etc. into a list of key names.
-        Returns empty list on failure.
+        Parse 'Alt+1' or 'Ctrl+Shift+F2' into a list of key name strings.
+        Returns an empty list on empty input.
         """
         if not hotkey_str:
             return []

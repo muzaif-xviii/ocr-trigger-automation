@@ -17,7 +17,6 @@ build/
 
 # Logs
 logs/
-*.logs
 
 # IDE
 .vscode/
@@ -26,6 +25,3 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
-
-# Config overrides
-config/local*.json

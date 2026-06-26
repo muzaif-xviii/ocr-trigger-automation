@@ -223,26 +223,6 @@ For a sequence action:
 
 ---
 
-## Project Status
-
-This project is an MVP/prototype demonstrating:
-
-- Real-time OCR screen monitoring
-- Trigger detection
-- Keyboard action execution
-- PySide6 desktop interface
-
-Originally developed as an exploration of OCR-based desktop automation workflows.
-
-Future improvements:
-- Better OCR preprocessing
-- Cross-platform keyboard handling
-- Windows packaging and testing
-- Advanced macro editor
-
-
----
-
 ## License
 
 MIT — for personal automation and accessibility use only.

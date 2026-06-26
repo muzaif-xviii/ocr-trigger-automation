@@ -44,8 +44,20 @@ from PySide6.QtWidgets import (
 
 from core.action_executor import ActionExecutor
 from core.config_manager import ConfigManager
-from core.ocr_engine import OcrEngine, OcrResult
-from core.screen_capture import ScreenCapture
+from core.ocr_engine import (
+    OcrEngine,
+    OcrResult,
+    TESS_CONFIG_BLOCK,
+    TESS_CONFIG_LINE,
+    TESS_CONFIG_SPARSE,
+)
+from core.screen_capture import (
+    ScreenCapture,
+    PREPROCESS_AUTO,
+    PREPROCESS_GAME,
+    PREPROCESS_LIGHT,
+    get_dpi_scale,
+)
 from core.trigger_engine import TriggerEngine, TriggerMatch
 from ui.region_selector import RegionSelector
 from ui.styles import (
@@ -98,9 +110,14 @@ class MainWindow(QMainWindow):
         # Core subsystems
         self._config = ConfigManager()
         self._ocr = OcrEngine(
-            confidence_threshold=self._config.get("ocr_confidence_threshold", 60)
+            # Lowered default from 60 → 30: FFXI bitmap font scores 35-65 per word;
+            # threshold=60 silently drops most valid game text before matching.
+            confidence_threshold=self._config.get("ocr_confidence_threshold", 30),
+            tesseract_config=self._config.get("tesseract_config", "--psm 11 --oem 3"),
         )
         self._capture = ScreenCapture()
+        # Apply saved preprocess mode (auto / light / game)
+        self._capture.preprocess_mode = self._config.get("preprocess_mode", "auto")
         self._trigger_engine = TriggerEngine()
         self._executor = ActionExecutor()
         self._signals = ScannerSignals()
@@ -122,7 +139,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._setup_tray()
-        # self._setup_global_hotkeys()
+        self._setup_global_hotkeys()
         self._executor.start()
 
         # Uptime ticker
@@ -153,7 +170,7 @@ class MainWindow(QMainWindow):
         self._stack.setObjectName("ContentArea")
         root_layout.addWidget(self._stack, 1)
 
-        # Pages (These methods now return the top-level outer page widget)
+        # Pages
         self._page_dashboard = self._build_dashboard()
         self._page_triggers = self._build_triggers_page()
         self._page_logs = self._build_logs_page()
@@ -222,8 +239,7 @@ class MainWindow(QMainWindow):
     # ── Dashboard ────────────────────────────────────────────────────── #
 
     def _build_dashboard(self) -> QWidget:
-        page = self._scrollable_page()
-        layout = page.findChild(QVBoxLayout, "TargetInnerLayout")
+        page, layout = self._scrollable_page()
 
         # Header row
         header_row = QHBoxLayout()
@@ -308,8 +324,7 @@ class MainWindow(QMainWindow):
     # ── Triggers page ────────────────────────────────────────────────── #
 
     def _build_triggers_page(self) -> QWidget:
-        page = self._scrollable_page()
-        layout = page.findChild(QVBoxLayout, "TargetInnerLayout")
+        page, layout = self._scrollable_page()
 
         header_row = QHBoxLayout()
         title = QLabel("Triggers")
@@ -355,8 +370,7 @@ class MainWindow(QMainWindow):
     # ── Logs page ────────────────────────────────────────────────────── #
 
     def _build_logs_page(self) -> QWidget:
-        page = self._scrollable_page()
-        layout = page.findChild(QVBoxLayout, "TargetInnerLayout")
+        page, layout = self._scrollable_page()
 
         header_row = QHBoxLayout()
         title = QLabel("Activity Log")
@@ -385,19 +399,19 @@ class MainWindow(QMainWindow):
     # ── Settings page ────────────────────────────────────────────────── #
 
     def _build_settings_page(self) -> QWidget:
-        page = self._scrollable_page()
-        layout = page.findChild(QVBoxLayout, "TargetInnerLayout")
+        from PySide6.QtWidgets import QLineEdit
+
+        page, layout = self._scrollable_page()
 
         title = QLabel("Settings")
         title.setObjectName("TitleLabel")
         layout.addWidget(title)
         layout.addSpacing(8)
 
-        # Scan settings
+        # ── Scan settings ────────────────────────────────────────────── #
         scan_panel = self._make_panel("SCAN SETTINGS")
         scan_form = QVBoxLayout()
 
-        # Interval
         interval_row = QHBoxLayout()
         interval_lbl = QLabel("Scan interval (ms):")
         interval_lbl.setStyleSheet(f"color: {TEXT_SECONDARY};")
@@ -414,16 +428,23 @@ class MainWindow(QMainWindow):
         interval_row.addStretch()
         scan_form.addLayout(interval_row)
 
-        # Confidence threshold
+        # Confidence threshold — default lowered to 30 for game compatibility
         conf_row = QHBoxLayout()
         conf_lbl = QLabel("OCR confidence threshold:")
         conf_lbl.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        conf_lbl.setToolTip(
+            "Minimum Tesseract word confidence to accept.\n"
+            "Desktop apps: 50-70.  Game / FFXI chat: 20-35.\n"
+            "Default is now 30 to avoid silently dropping game text."
+        )
         self._conf_slider = QSlider(Qt.Orientation.Horizontal)
         self._conf_slider.setRange(0, 100)
-        self._conf_slider.setValue(self._config.get("ocr_confidence_threshold", 60))
+        self._conf_slider.setValue(self._config.get("ocr_confidence_threshold", 30))
         self._conf_slider.setFixedWidth(200)
         self._conf_slider_label = QLabel(f"{self._conf_slider.value()}%")
-        self._conf_slider_label.setStyleSheet(f"color: {ACCENT_PRIMARY}; font-weight: 600; min-width: 36px;")
+        self._conf_slider_label.setStyleSheet(
+            f"color: {ACCENT_PRIMARY}; font-weight: 600; min-width: 36px;"
+        )
         self._conf_slider.valueChanged.connect(self._on_conf_slider_changed)
         conf_row.addWidget(conf_lbl)
         conf_row.addWidget(self._conf_slider)
@@ -434,9 +455,41 @@ class MainWindow(QMainWindow):
         scan_panel.layout().addLayout(scan_form)
         layout.addWidget(scan_panel)
 
-        # Tesseract
+        # ── OCR preprocessing mode ───────────────────────────────────── #
+        preproc_panel = self._make_panel("IMAGE PREPROCESSING MODE")
+        preproc_layout = QVBoxLayout()
+
+        preproc_hint = QLabel(
+            "Auto — detects dark/light background per frame (recommended).\n"
+            "Light — dark text on bright background (Notepad, browser, Telegram).\n"
+            "Game — coloured/white text on dark background (FFXI, MMO chat logs).\n\n"
+            "If OCR works on desktop apps but produces garbage on FFXI, set this to Game."
+        )
+        preproc_hint.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+        preproc_hint.setWordWrap(True)
+        preproc_layout.addWidget(preproc_hint)
+
+        preproc_row = QHBoxLayout()
+        preproc_lbl = QLabel("Preprocessing mode:")
+        preproc_lbl.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        self._preproc_combo = QComboBox()
+        self._preproc_combo.addItems(["auto", "light", "game"])
+        saved_mode = self._config.get("preprocess_mode", "auto")
+        idx = self._preproc_combo.findText(saved_mode)
+        if idx >= 0:
+            self._preproc_combo.setCurrentIndex(idx)
+        self._preproc_combo.currentTextChanged.connect(self._on_preproc_mode_changed)
+        preproc_row.addWidget(preproc_lbl)
+        preproc_row.addWidget(self._preproc_combo)
+        preproc_row.addStretch()
+        preproc_layout.addLayout(preproc_row)
+        preproc_panel.layout().addLayout(preproc_layout)
+        layout.addWidget(preproc_panel)
+
+        # ── Tesseract OCR settings ───────────────────────────────────── #
         tess_panel = self._make_panel("TESSERACT OCR")
         tess_layout = QVBoxLayout()
+
         tess_hint = QLabel(
             "Tesseract must be installed separately.\n"
             "Windows: https://github.com/UB-Mannheim/tesseract/wiki\n"
@@ -444,8 +497,8 @@ class MainWindow(QMainWindow):
         )
         tess_hint.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
         tess_hint.setWordWrap(True)
+        tess_layout.addWidget(tess_hint)
 
-        from PySide6.QtWidgets import QLineEdit
         tess_path_row = QHBoxLayout()
         tess_path_lbl = QLabel("Tesseract path (optional):")
         tess_path_lbl.setStyleSheet(f"color: {TEXT_SECONDARY};")
@@ -455,13 +508,85 @@ class MainWindow(QMainWindow):
         self._tess_path_edit.textChanged.connect(self._on_tess_path_changed)
         tess_path_row.addWidget(tess_path_lbl)
         tess_path_row.addWidget(self._tess_path_edit, 1)
-
-        tess_layout.addWidget(tess_hint)
         tess_layout.addLayout(tess_path_row)
+
+        # PSM (Page Segmentation Mode) selector
+        psm_row = QHBoxLayout()
+        psm_lbl = QLabel("Page segmentation (PSM):")
+        psm_lbl.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        psm_lbl.setToolTip(
+            "PSM 11 Sparse — best for full-screen / game HUD (DEFAULT).\n"
+            "PSM 6 Block  — best for a tightly-cropped chat box region.\n"
+            "PSM 7 Line   — single line, for narrow status bars.\n\n"
+            "PSM 6 with a full-screen game capture is a common cause of\n"
+            "garbage output — the layout analyser mis-segments the HUD."
+        )
+        self._psm_combo = QComboBox()
+        self._psm_combo.addItems([
+            "PSM 11 — Sparse text (game / full-screen)  [recommended]",
+            "PSM 6  — Uniform text block (cropped chat box)",
+            "PSM 7  — Single line",
+        ])
+        psm_map = {
+            "--psm 11 --oem 3": 0,
+            "--psm 6 --oem 3": 1,
+            "--psm 7 --oem 3": 2,
+        }
+        saved_cfg = self._config.get("tesseract_config", "--psm 11 --oem 3")
+        self._psm_combo.setCurrentIndex(psm_map.get(saved_cfg, 0))
+        self._psm_combo.currentIndexChanged.connect(self._on_psm_changed)
+        psm_row.addWidget(psm_lbl)
+        psm_row.addWidget(self._psm_combo, 1)
+        tess_layout.addLayout(psm_row)
+
         tess_panel.layout().addLayout(tess_layout)
         layout.addWidget(tess_panel)
 
-        # Profiles
+        # ── DPI / Debug diagnostics ──────────────────────────────────── #
+        diag_panel = self._make_panel("DIAGNOSTICS")
+        diag_layout = QVBoxLayout()
+
+        dpi_scale = get_dpi_scale()
+        dpi_info = QLabel(
+            f"Detected DPI scale: {dpi_scale:.2f}×  ({int(dpi_scale * 96)} DPI)\n"
+            "If DPI scale > 1.0, region coordinates are automatically converted from\n"
+            "logical (Qt) pixels to physical pixels before capture. This fixes\n"
+            "the common issue where the region selector crops the wrong area on\n"
+            "125% / 150% / 200% scaled displays."
+        )
+        dpi_info.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+        dpi_info.setWordWrap(True)
+        diag_layout.addWidget(dpi_info)
+
+        debug_row = QHBoxLayout()
+        debug_hint = QLabel(
+            "Save a single raw + processed debug frame to debug_frames/ to verify\n"
+            "what the capture and preprocessing pipeline actually produces:"
+        )
+        debug_hint.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+        debug_hint.setWordWrap(True)
+
+        debug_btn = QPushButton("Save Debug Frame")
+        debug_btn.setObjectName("SecondaryButton")
+        debug_btn.setToolTip(
+            "Saves debug_frames/debug_raw.png and debug_frames/debug_processed.png.\n"
+            "Open these to verify:\n"
+            "  raw.png     — is the correct area being captured?\n"
+            "  processed.png — is the text legible after preprocessing?"
+        )
+        debug_btn.clicked.connect(self._save_debug_frame)
+        self._debug_path_label = QLabel("")
+        self._debug_path_label.setStyleSheet(f"color: {ACCENT_PRIMARY}; font-size: 11px;")
+
+        debug_row.addWidget(debug_btn)
+        debug_row.addWidget(self._debug_path_label, 1)
+        diag_layout.addWidget(debug_hint)
+        diag_layout.addLayout(debug_row)
+
+        diag_panel.layout().addLayout(diag_layout)
+        layout.addWidget(diag_panel)
+
+        # ── Profiles ─────────────────────────────────────────────────── #
         profile_panel = self._make_panel("PROFILES")
         profile_layout = QVBoxLayout()
         profile_hint = QLabel("Save and load complete trigger profiles (JSON files in /profiles/).")
@@ -500,11 +625,31 @@ class MainWindow(QMainWindow):
     # ================================================================== #
 
     @staticmethod
-    def _scrollable_page() -> QWidget:
-        """Return a page widget with a scroll area that retains proper parent ownership."""
+    def _scrollable_page():
+        """
+        Return (outer_widget, inner_layout).
+
+        outer_widget  — the QWidget to add to the QStackedWidget.
+        inner_layout  — the QVBoxLayout inside the scroll area; callers
+                        append their content widgets here directly.
+
+        Why the old design crashed
+        --------------------------
+        The previous version returned `inner` (the scroll child) directly
+        and expected callers to recover the layout via findChild(QVBoxLayout).
+        In PySide6, findChild returns a plain Python wrapper with no extra
+        reference count.  As soon as the call expression ended the wrapper was
+        eligible for garbage collection, leaving a dangling C++ pointer.  The
+        next access raised RuntimeError: Internal C++ object already deleted.
+
+        Returning the layout as a second value keeps a live Python reference
+        for the entire lifetime of the calling method, which is all that is
+        needed.
+        """
         outer = QWidget()
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -512,15 +657,13 @@ class MainWindow(QMainWindow):
 
         inner = QWidget()
         inner_layout = QVBoxLayout(inner)
-        inner_layout.setObjectName("TargetInnerLayout")
         inner_layout.setContentsMargins(28, 24, 28, 24)
         inner_layout.setSpacing(12)
 
-        inner.setLayout(inner_layout)
         scroll.setWidget(inner)
         outer_layout.addWidget(scroll)
 
-        return outer  # Return the parent widget so it is not garbage collected
+        return outer, inner_layout
 
     @staticmethod
     def _make_panel(title: str = "") -> QWidget:
@@ -554,8 +697,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _stat_set(card: QWidget, value: str) -> None:
-        if hasattr(card, "_val_label"):
-            card._val_label.setText(value)  # type: ignore[attr-defined]
+        card._val_label.setText(value)  # type: ignore[attr-defined]
 
     def _region_display_text(self) -> str:
         r = self._config.get_region()
@@ -630,6 +772,8 @@ class MainWindow(QMainWindow):
     def _scan_loop(self) -> None:
         """Background thread: capture → OCR → match → execute."""
         capture = ScreenCapture()
+        # Copy preprocess mode from the shared instance so settings changes
+        # that happen while scanning are picked up on the next loop tick.
         capture.open()
         scan_interval_s = self._config.get("scan_interval", 300) / 1000.0
 
@@ -637,13 +781,19 @@ class MainWindow(QMainWindow):
             while not self._stop_event.is_set():
                 loop_start = time.monotonic()
 
+                # Re-read config every loop so interval/region changes apply live
+                scan_interval_s = self._config.get("scan_interval", 300) / 1000.0
                 region = self._config.get_region()
+
+                # Sync preprocess mode from the main-thread capture instance
+                capture.preprocess_mode = self._capture.preprocess_mode
+
                 raw = capture.capture(region)
                 if raw is None:
                     time.sleep(0.1)
                     continue
 
-                processed = ScreenCapture.preprocess(raw)
+                processed = ScreenCapture.preprocess(raw, mode=capture.preprocess_mode)
                 result: OcrResult = self._ocr.run(processed)
 
                 self._scan_count += 1
@@ -885,6 +1035,36 @@ class MainWindow(QMainWindow):
         if path.strip():
             self._ocr.set_tesseract_cmd(path.strip())
 
+    def _on_preproc_mode_changed(self, mode: str) -> None:
+        """Update preprocessing mode on both the main capture instance and config."""
+        self._capture.preprocess_mode = mode
+        self._config.set("preprocess_mode", mode)
+        self._log("system", f"Preprocessing mode changed to: {mode}")
+
+    def _on_psm_changed(self, index: int) -> None:
+        """Map combo index back to tesseract config string."""
+        psm_configs = [
+            "--psm 11 --oem 3",  # 0 — sparse (default, game-safe)
+            "--psm 6 --oem 3",   # 1 — uniform block (cropped chat)
+            "--psm 7 --oem 3",   # 2 — single line
+        ]
+        if 0 <= index < len(psm_configs):
+            cfg = psm_configs[index]
+            self._ocr.set_tesseract_config(cfg)
+            self._config.set("tesseract_config", cfg)
+            self._log("system", f"Tesseract PSM changed to: {cfg}")
+
+    def _save_debug_frame(self) -> None:
+        """Capture one frame, save raw+processed PNGs, show path in UI."""
+        region = self._config.get_region()
+        path = self._capture.save_single_debug_frame(region)
+        if path:
+            self._debug_path_label.setText(f"Saved → {path}")
+            self._log("system", f"Debug frame saved: {path}")
+        else:
+            self._debug_path_label.setText("Capture failed — is a monitor connected?")
+            self._log("error", "Debug frame capture failed")
+
     def _save_profile(self) -> None:
         name = self._profile_name_edit.text().strip()
         if not name:
@@ -950,6 +1130,7 @@ class MainWindow(QMainWindow):
             logger.warning("Could not register global hotkeys: %s", exc)
 
     def _hotkey_toggle_scan(self) -> None:
+        # keyboard callbacks run in a separate thread — use QTimer to hop to UI thread
         QTimer.singleShot(0, self._toggle_scanning)
 
     def _hotkey_emergency_stop(self) -> None:
@@ -970,6 +1151,7 @@ class MainWindow(QMainWindow):
             return
 
         self._tray = QSystemTrayIcon(self)
+        # Use a simple coloured icon from built-in Qt icons
         self._tray.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon))
         self._tray.setToolTip("Screen Trigger Macro")
 
@@ -1013,19 +1195,34 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _action_to_display(action: dict) -> str:
         a_type = action.get("type", "hotkey")
+
         if a_type == "hotkey":
             keys = action.get("keys", [])
             return "+".join(k.upper() for k in keys) or "(no keys)"
+
+        elif a_type == "text":
+            raw = action.get("text", "")
+            # Show up to 40 chars; replace newlines with ↵ for readability
+            preview = raw.replace("\n", " ↵ ").replace("\r", "")
+            return f'"{preview[:40]}{"…" if len(preview) > 40 else ""}"'
+
         elif a_type == "sequence":
             steps = action.get("sequence", [])
-            parts = []
+            parts: list[str] = []
             for s in steps[:3]:
-                if s.get("type") == "hotkey":
+                st = s.get("type")
+                if st == "hotkey":
                     parts.append("+".join(k.upper() for k in s.get("keys", [])))
-                elif s.get("type") == "delay":
-                    parts.append(f"wait {s['ms']}ms")
-            suffix = f" +{len(steps)-3} more" if len(steps) > 3 else ""
+                elif st == "key":
+                    parts.append(f"[{s.get('key', '')}]")
+                elif st == "text":
+                    t = s.get("text", "")
+                    parts.append(f'"{t[:15]}{"…" if len(t) > 15 else ""}"')
+                elif st == "delay":
+                    parts.append(f"wait {s.get('ms', 0)}ms")
+            suffix = f" +{len(steps) - 3} more" if len(steps) > 3 else ""
             return " → ".join(parts) + suffix
+
         return str(action)
 
     # ================================================================== #
